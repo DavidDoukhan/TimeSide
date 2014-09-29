@@ -20,13 +20,13 @@
 # Author: David Doukhan <doukhan@limsi.fr>
 
 
-from timeside.core import implements, interfacedoc
+from timeside.core import implements, interfacedoc, get_processor
 from timeside.analyzer.core import Analyzer
 from timeside.api import IAnalyzer
 from yaafe import Yaafe
 import yaafelib
 from timeside.analyzer.limsi_sad import LimsiSad
-import numpy as N
+import numpy as np
 import sys
 
 from pyannote.features.audio.yaafe import YaafeFrame
@@ -37,23 +37,29 @@ from pyannote.algorithms.clustering.bic import BICClustering
 
 
 def gauss_div(data, winsize):
+    """
+    Gaussian Divergence
+    """
     ret = []
     for i in xrange(winsize , len(data) - winsize +1):
         w1 = data[(i-winsize):i,:]
         w2 = data[i:(i+winsize),:]
-        meandiff = N.mean(w1, axis = 0) - N.mean(w2, axis = 0)
-        invstdprod = 1. / (N.std(w1, axis = 0) * N.std(w2, axis = 0))
-        ret.append(N.sum(meandiff * meandiff * invstdprod))
+        meandiff = np.mean(w1, axis = 0) - np.mean(w2, axis = 0)
+        invstdprod = 1. / (np.std(w1, axis = 0) * np.std(w2, axis = 0))
+        ret.append(np.sum(meandiff * meandiff * invstdprod))
 
     return ret
 
 
 def segment(data, minsize):
-
+    """
+    Recursive procedure aimed at segmenting speech streams in homogeneous segments
+    based on the gaussian divergence estimates
+    """
     if len(data) == 0:
         return []
 
-    am = N.argmax(data)
+    am = np.argmax(data)
     if am <= minsize:
         ret1 = ([0] * am)
     else:
@@ -78,13 +84,12 @@ class LimsiDiarization(Analyzer):
         if sad_analyzer is None:
             sad_analyzer = LimsiSad('etape')
         self.sad_analyzer = sad_analyzer
-        self.parents.append(sad_analyzer)
+        self.parents['sad4limsidiar'] = sad_analyzer
 
         # feature extraction defition
         spec = yaafelib.FeaturePlan(sample_rate=16000)
         spec.addFeature('mfccchop: MFCC CepsIgnoreFirstCoeff=0 blockSize=1024 stepSize=256')
-        parent_analyzer = Yaafe(spec)
-        self.parents.append(parent_analyzer)
+        self.parents['yaafe4limsidiar'] = Yaafe(spec)
 
         # informative parameters
         # these are not really taken into account by the system
@@ -109,14 +114,18 @@ class LimsiDiarization(Analyzer):
         # return the unit of the data dB, St, ...
         return "Speaker Id"
 
+    @property
+    def force_samplerate(self):
+        return 16000
+
     def process(self, frames, eod=False):
-        if self.input_samplerate != 16000:
-            raise Exception('%s requires 16000 input sample rate: %d provided' % (self.__class__.__name__, self.input_samplerate))
         return frames, eod
 
     def post_process(self):
         # extract mfcc with yaafe and store them to be used with pyannote
-        mfcc = self.process_pipe.results.get_result_by_id('yaafe.mfccchop')['data_object']['value']
+        yaafe_result = self.process_pipe.results[self.parents['yaafe4limsidiar'].uuid()]
+        mfcc = yaafe_result['yaafe.mfccchop']['data_object']['value']
+
 
         sw = YaafeFrame(self.input_blocksize, self.input_stepsize, self.input_samplerate)
         pyannotefeat = SlidingWindowFeature(mfcc, sw)
@@ -127,7 +136,8 @@ class LimsiDiarization(Analyzer):
         min_seg_size_frame = int(self.min_seg_size_sec / timestepsize)
 
         # speech activity detection
-        sadval = self.process_pipe.results.get_result_by_id(self.sad_analyzer.id() + '.sad_lhh_diff').data_object.value[:]
+        sadresult = self.process_pipe.results[self.parents['sad4limsidiar'].uuid()]
+        sadval = sadresult[self.sad_analyzer.id() + '.sad_lhh_diff'].data_object.value[:]
         # indices of frames detected as speech
         speech_threshold = 0.
         frameids = [i for i, val in enumerate(sadval) if val > speech_threshold]
@@ -190,8 +200,8 @@ class LimsiDiarization(Analyzer):
         diar_res.data_object.label = label
         diar_res.data_object.time = time
         diar_res.data_object.duration = duration
-        diar_res.label_metadata.label = dict()
+        diar_res.data_object.label_metadata.label = dict()
         for lab in diar_res.data_object.label:
-            diar_res.label_metadata.label[lab] = str(lab)
+            diar_res.data_object.label_metadata.label[lab] = str(lab)
             
-        self.process_pipe.results.add(diar_res)
+        self.add_result(diar_res)
